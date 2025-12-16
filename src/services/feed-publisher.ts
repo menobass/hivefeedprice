@@ -9,6 +9,8 @@ import {
 import createBeekeeper, {
   type IBeekeeperUnlockedWallet,
   type IBeekeeperWallet,
+  type IBeekeeperInstance,
+  type IBeekeeperSession,
 } from "@hiveio/beekeeper";
 import { priceAggregator } from "@/services/price-aggregator";
 import { loadConfig } from "@/config/config";
@@ -31,8 +33,9 @@ export class FeedPublisher {
   private hiveChainFailover: HiveChainWithFailover | null = null;
   private hive: IHiveChainInterface | null = null;
   private wax: IWaxBaseInterface | null = null;
-  private wallet: IBeekeeperUnlockedWallet | null = null;
+  private beekeeper: IBeekeeperInstance | null = null;
   private publicKey: string | null = null;
+  private walletInitialized = false;
 
   constructor(config: HiveConfig) {
     if (!config.witnessAccount) {
@@ -60,58 +63,72 @@ export class FeedPublisher {
       await this.hiveChainFailover.initialize();
       this.hive = this.hiveChainFailover.getChain();
 
-      const bk = await createBeekeeper();
-      const session = bk.createSession(
-        `${BEEKEEPER.WALLET_NAME}-${Date.now()}`
-      );
+      // Initialize beekeeper instance (keep for reuse)
+      this.beekeeper = await createBeekeeper();
 
-      let walletExists = false;
-      let walletValid = false;
-
-      try {
-        const lockedWallet: IBeekeeperWallet = await session.openWallet(
-          BEEKEEPER.WALLET_NAME
-        );
-        const unlockedWallet = await lockedWallet.unlock(
-          BEEKEEPER.WALLET_PASSWORD
-        );
-
-        const publicKeys = await unlockedWallet.getPublicKeys();
-        if (!publicKeys || publicKeys.length === 0) {
-          throw new Error("No public keys found in wallet");
-        }
-
-        walletExists = true;
-        this.wallet = unlockedWallet;
-        this.publicKey = publicKeys[0];
-        walletValid = true;
-      } catch (openErr) {
-        // Wallet doesn't exist or failed to open
-        walletExists = false;
-      }
-
-      // Create wallet if it doesn't exist
-      if (!walletExists) {
-        if (!this.config.privateKey) {
-          throw new Error(
-            "HIVE_SIGNING_PRIVATE_KEY is required for wallet creation"
-          );
-        }
-
-        const { wallet } = await session.createWallet(
-          BEEKEEPER.WALLET_NAME,
-          BEEKEEPER.WALLET_PASSWORD,
-          false
-        );
-        this.publicKey = await wallet.importKey(this.config.privateKey);
-        this.wallet = wallet;
-
-        console.log("\x1b[32m[SUCCESS]\x1b[0m Wallet created with signing key");
-      } else if (walletValid) {
-        console.log("\x1b[32m[SUCCESS]\x1b[0m Using existing wallet");
-      }
+      // Initialize wallet and get public key
+      await this.ensureWalletReady();
+      
     } catch (error) {
       throw new Error(`Failed to initialize: ${error}`);
+    }
+  }
+
+  /**
+   * Ensures the wallet is ready for signing.
+   * Creates a fresh session and opens/creates the wallet each time to avoid timeout issues.
+   */
+  private async ensureWalletReady(): Promise<IBeekeeperUnlockedWallet> {
+    if (!this.beekeeper) {
+      throw new Error("Beekeeper not initialized");
+    }
+
+    // Create a fresh session each time to avoid timeout issues
+    const session = this.beekeeper.createSession(
+      `${BEEKEEPER.WALLET_NAME}-${Date.now()}`
+    );
+
+    try {
+      // Try to open existing wallet
+      const lockedWallet: IBeekeeperWallet = await session.openWallet(
+        BEEKEEPER.WALLET_NAME
+      );
+      const unlockedWallet = await lockedWallet.unlock(
+        BEEKEEPER.WALLET_PASSWORD
+      );
+
+      const publicKeys = await unlockedWallet.getPublicKeys();
+      if (!publicKeys || publicKeys.length === 0) {
+        throw new Error("No public keys found in wallet");
+      }
+
+      this.publicKey = publicKeys[0];
+      
+      if (!this.walletInitialized) {
+        console.log("\x1b[32m[SUCCESS]\x1b[0m Using existing wallet");
+        this.walletInitialized = true;
+      }
+      
+      return unlockedWallet;
+    } catch (openErr) {
+      // Wallet doesn't exist, create it
+      if (!this.config.privateKey) {
+        throw new Error(
+          "HIVE_SIGNING_PRIVATE_KEY is required for wallet creation"
+        );
+      }
+
+      const { wallet } = await session.createWallet(
+        BEEKEEPER.WALLET_NAME,
+        BEEKEEPER.WALLET_PASSWORD,
+        false
+      );
+      this.publicKey = await wallet.importKey(this.config.privateKey);
+      
+      console.log("\x1b[32m[SUCCESS]\x1b[0m Wallet created with signing key");
+      this.walletInitialized = true;
+      
+      return wallet;
     }
   }
 
@@ -156,9 +173,12 @@ export class FeedPublisher {
         "Hive connection not initialized. Call initialize() first."
       );
     }
-    if (!this.wallet || !this.publicKey) {
-      throw new Error("Wallet not initialized or public key missing");
+    if (!this.publicKey) {
+      throw new Error("Public key not initialized");
     }
+
+    // Get a fresh wallet session before each broadcast to avoid timeout issues
+    const wallet = await this.ensureWalletReady();
 
     // Use failover to execute the broadcast operation
     return await this.hiveChainFailover.executeWithFailover(
@@ -180,7 +200,7 @@ export class FeedPublisher {
         tx.pushOperation(witnessOperation);
 
         const transactionId = tx.id;
-        tx.sign(this.wallet!, this.publicKey!);
+        tx.sign(wallet, this.publicKey!);
 
         await chain.broadcast(tx);
         return transactionId;
