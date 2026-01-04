@@ -85,9 +85,20 @@ export class FeedPublisher {
       throw new Error("Beekeeper not initialized");
     }
 
-    // Reuse existing session and wallet if available
+    // Try to verify existing wallet is still valid
     if (this.session && this.wallet) {
-      return this.wallet;
+      try {
+        // Validate wallet is still functional
+        const keys = await this.wallet.getPublicKeys();
+        if (keys && keys.length > 0) {
+          return this.wallet;
+        }
+      } catch (err) {
+        // Wallet is no longer valid, need to recreate
+        console.log("\x1b[33m[WARN]\x1b[0m Wallet session expired, recreating...");
+        this.wallet = null;
+        this.session = null;
+      }
     }
 
     // Create a session only once (or if previous one was closed)
